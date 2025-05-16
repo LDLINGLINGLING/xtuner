@@ -39,7 +39,7 @@ loss_beta = 0.1
 label_smoothing = 0.0
 
 # Data
-prompt_template = PROMPT_TEMPLATE.minicpm3
+prompt_template = PROMPT_TEMPLATE.minicpm4
 max_length = 2048
 
 # Scheduler & Optimizer

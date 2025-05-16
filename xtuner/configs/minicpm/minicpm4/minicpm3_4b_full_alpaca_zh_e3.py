@@ -1,5 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch
 from datasets import load_dataset
 from mmengine.dataset import DefaultSampler
 from mmengine.hooks import (
@@ -10,22 +9,20 @@ from mmengine.hooks import (
     ParamSchedulerHook,
 )
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
-from peft import LoraConfig
 from torch.optim import AdamW
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from xtuner.dataset.collate_fns.preference_collate_fn import preference_collate_fn
-from xtuner.dataset.preference_dataset import (
-    build_preference_dataset,
-    orpo_dpo_mix_40k_map_fn,
-)
+from xtuner.dataset import process_hf_dataset
+from xtuner.dataset.collate_fns import default_collate_fn
+from xtuner.dataset.map_fns import alpaca_zh_map_fn, template_map_fn_factory
 from xtuner.engine.hooks import (
     DatasetInfoHook,
     EvaluateChatHook,
     VarlenAttnArgsToMessageHubHook,
 )
 from xtuner.engine.runner import TrainLoop
-from xtuner.model.dpo import DPO
+from xtuner.model import SupervisedFinetune
+from xtuner.parallel.sequence import SequenceParallelSampler
 from xtuner.utils import PROMPT_TEMPLATE, SYSTEM_TEMPLATE
 
 #######################################################################
@@ -34,21 +31,24 @@ from xtuner.utils import PROMPT_TEMPLATE, SYSTEM_TEMPLATE
 # Model
 pretrained_model_name_or_path = "openbmb/MiniCPM3-4B"
 use_varlen_attn = False
-dpo_loss_type = "sigmoid"  # One of ['sigmoid', 'hinge', 'ipo', 'kto_pair', 'sppo_hard', 'nca_pair', 'robust']  # noqa: E501
-loss_beta = 0.1
-label_smoothing = 0.0
 
 # Data
+alpaca_en_path = "silk-road/alpaca-data-gpt4-chinese"
 prompt_template = PROMPT_TEMPLATE.minicpm3
 max_length = 2048
+pack_to_max_length = True
+
+# parallel
+sequence_parallel_size = 1
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
 accumulative_counts = 16
+accumulative_counts *= sequence_parallel_size
 dataloader_num_workers = 0
-max_steps = 3
+max_steps = 10000
 optim_type = AdamW
-lr = 5e-7  # refer to alignment handbook
+lr = 2e-5
 betas = (0.9, 0.999)
 weight_decay = 0
 max_norm = 1  # grad clip
@@ -61,11 +61,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 500
 SYSTEM = SYSTEM_TEMPLATE.alpaca
-evaluation_inputs = [
-    'What famous British author, known for his tales of mystery and the macabre, shares his initials with a common abbreviation for "rest in peace"?',  # noqa: E501
-    "Please tell me five scenic spots in Shanghai",
-    "890729 - 425663? Only respond with math and no words.",
-]
+evaluation_inputs = ["请给我介绍五个上海的景点", "Please tell me five scenic spots in Shanghai"]
 
 #######################################################################
 #                      PART 2  Model & Tokenizer                      #
@@ -75,63 +71,43 @@ tokenizer = dict(
     pretrained_model_name_or_path=pretrained_model_name_or_path,
     trust_remote_code=True,
     padding_side="right",
+    eos_token="</s>",
 )
 
 model = dict(
-    type=DPO,
+    type=SupervisedFinetune,
     use_varlen_attn=use_varlen_attn,
-    loss_type=dpo_loss_type,
-    beta=loss_beta,
-    label_smoothing=label_smoothing,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
-        quantization_config=dict(
-            type=BitsAndBytesConfig,
-            load_in_4bit=True,
-            load_in_8bit=False,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        ),
-    ),
-    lora=dict(
-        type=LoraConfig,
-        r=64,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        bias="none",
-        task_type="CAUSAL_LM",
     ),
 )
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
-train_dataset = dict(
-    type=build_preference_dataset,
-    dataset=dict(type=load_dataset, path="mlabonne/orpo-dpo-mix-40k"),
+alpaca_en = dict(
+    type=process_hf_dataset,
+    dataset=dict(type=load_dataset, path=alpaca_en_path),
     tokenizer=tokenizer,
     max_length=max_length,
-    dataset_map_fn=orpo_dpo_mix_40k_map_fn,
-    is_dpo=True,
-    is_reward=False,
-    reward_token_id=-1,
-    num_proc=32,
-    use_varlen_attn=use_varlen_attn,
+    dataset_map_fn=alpaca_zh_map_fn,
+    template_map_fn=dict(type=template_map_fn_factory, template=prompt_template),
+    remove_unused_columns=True,
     shuffle_before_pack=True,
+    pack_to_max_length=pack_to_max_length,
+    use_varlen_attn=use_varlen_attn,
 )
+
+sampler = SequenceParallelSampler if sequence_parallel_size > 1 else DefaultSampler
 
 train_dataloader = dict(
     batch_size=batch_size,
     num_workers=dataloader_num_workers,
-    dataset=train_dataset,
-    sampler=dict(type=DefaultSampler, shuffle=True),
-    collate_fn=dict(type=preference_collate_fn, use_varlen_attn=use_varlen_attn),
+    dataset=alpaca_en,
+    sampler=dict(type=sampler, shuffle=True),
+    collate_fn=dict(type=default_collate_fn, use_varlen_attn=use_varlen_attn),
 )
 
 #######################################################################
