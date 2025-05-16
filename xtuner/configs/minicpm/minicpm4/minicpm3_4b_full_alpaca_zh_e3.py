@@ -34,7 +34,7 @@ use_varlen_attn = False
 
 # Data
 alpaca_en_path = "silk-road/alpaca-data-gpt4-chinese"
-prompt_template = PROMPT_TEMPLATE.minicpm3
+prompt_template = PROMPT_TEMPLATE.minicpm4
 max_length = 2048
 pack_to_max_length = True
 
